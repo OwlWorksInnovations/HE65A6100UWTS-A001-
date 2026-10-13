@@ -1,1 +1,1 @@
-Find the orginal firmware download in the repo, FINDINGS.md is what i found so far. Not all of it is tested so don't 100% rely on it.
+Find the orginal firmware download [here](https://drive.google.com/file/d/1D-JyIN0ZPHvgJAVq0iIYo3tmpEy4Sg1j/view?usp=sharing), FINDINGS.md is what i found so far. Not all of it is tested so don't 100% rely on it.
