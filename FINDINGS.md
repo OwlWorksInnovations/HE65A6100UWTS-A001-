@@ -66,14 +66,54 @@ Mount points the **signed** rootfs uses resolve into **unsigned** partitions:
 | Live root access | **Easy** | UART ttyS0 root shell (no auth) |
 | Fix TV issues | **Doable** | Root → patch unsigned config/app partitions |
 | Run own code / userland | **Doable** | Modify unsigned `tvservice` (apps, libs) |
-| Custom kernel module | **Likely** | Drop `.ko` in `/tvservice/modules` (if modsign off) |
-| Boot own kernel/Linux | **Hard** | Blocked by eFUSE secure boot; needs bootloader/TEE exploit or glitch |
+| Custom kernel module | **Confirmed** | Kernel has **no module-sig verification** (CONFIG_MODULE_SIG off). Build against vermagic `4.9.44+ SMP preempt mod_unload ARMv7`, drop `.ko` in `/tvservice/modules`, `insmod`. |
+| Boot own kernel/Linux | **Unconfirmed — possibly an env-config gap** | MBOOT's default `bootcmd` is plain `mmc read + bootm` (CRC only); KL/RFS RSA auth exists but is wired **only** to OTA/recovery/console (`authenticate`/`SecureBootCmd`), not the normal boot path. If the live TV's saved `bootcmd` matches, a modified kernel may boot without a sig check. **Must confirm live `bootcmd` via UART `printenv`.** Chain-of-trust every boot covers MBOOT/OPTEE/ARMFW only. |
 
 ## Next steps
 1. **Confirm the real TV has an accessible UART header** (3–4 pins near the SoC, 3.3 V) → get root shell.
 2. From root: `mount -o remount,rw /dev/mmcblk0p18 /tvservice`, inspect, back up, then stage custom binaries/modules.
-3. Static analysis of the boot/verify logic in **MBOOT** (Ghidra/REA) to check *when* RFS is verified (every boot vs post-OTA only) — a gap there could widen options.
-4. Check kernel `.ko` loading: whether `module.sig_enforce` / CONFIG_MODULE_SIG is set (decompile kernel or read dtb/cmdline).
+3. ~~Static analysis of the boot/verify logic in **MBOOT**~~ → **DONE + corrected** (see Update 2026-10-14). Normal boot path does **NOT** RSA-verify KL/RFS — it's `mmc read` + `bootm` (CRC only); auth runs only at OTA/recovery. Earlier "every boot" claim was wrong.
+4. ~~Check kernel `.ko` loading / module signing~~ → **DONE** (see Update below). Module signing is **off**.
 5. For "fix issues": diff this M0609 against the exact P0305 build later, and identify the config/app files behind the specific bugs.
+6. Extract the `tvservice` partition (LZO blob @ `0x1e51a000`, len `0x24271dd` in the `.bin`) to get the full ~30-module set referenced by `/etc/insmoddrv.sh` (only `kdrv_xc.ko`, `utpa2k.ko` are in the rootfs).
 
-_Artifacts: `firmware/M0609/parts/` (carved partitions), `RFS_root/` (extracted rootfs), `partition_map.txt`._
+_Artifacts: `firmware/M0609/parts/` (carved partitions), `RFS_root/` (extracted rootfs), `partition_map.txt`, `finding_mimo/` (MBOOT Ghidra headless + symbol crack)._
+
+> **Full component-by-component analysis of every partition:** see `finding_mimo/FIRMWARE_ANALYSIS.md` (2026-10-14). Covers kernel, MBOOT, rootfs (init/accounts/caps/tools/symlinks), the complete `tvservice` (50 modules, app stack, 25 OP-TEE TAs — all unsigned), OP-TEE, dtb, and all config/data/key partitions (certificate, cacert, critical/factory/model/serial data, DBs), with a consolidated access-surface summary.
+
+## Update 2026-10-13 — static deep-dive (kernel + MBOOT auth)
+
+### Kernel (KL) facts
+- **Linux 4.9.44+**, ARM 32-bit, **uncompressed** uImage payload (`comp=none`), load/entry `0x20208000`.
+  Banner: `#2 SMP PREEMPT Thu Jun 9 19:50:05 CST 2022`, gcc 4.8.3 (Sourcery CodeBench 2014.05).
+- Boot cmdline (default env): `root=/dev/mmcblk0p7 rootfstype=squashfs rw rootwait`, `console=ttyS2,115200n8`, `bootdelay=0`.
+
+### FINDINGS #4 — kernel module signing: **OFF (decisive)**
+Searched the decompressed kernel image:
+- `~Module signature appended~` (MODULE_SIG_STRING) — **absent**
+- `mod_verify_sig`, `module_sig_check`, PKCS#7 / X.509 parser strings — **all absent**
+
+MODULE_SIG_STRING compiles in **iff** `CONFIG_MODULE_SIG=y`; its absence means signature verification isn't in this kernel. The lone `module.sig_enforce` token is just a parameter-name string in the kernel's param/blacklist table (adjacent to `nomodule`, `module_blacklist`), not an active check.
+- Shipped modules (`kdrv_xc.ko`, `utpa2k.ko`) are plain ELF with **no signature trailer**, confirming unsigned loading at boot.
+- `vermagic=4.9.44+ SMP preempt mod_unload ARMv7`; no `__versions`/modversions section → **CONFIG_MODVERSIONS off**, so only the vermagic string must match (no per-symbol CRC). `insmod --force` or a matching-vermagic build loads.
+
+→ **Custom kernel-level code via `.ko` is confirmed feasible** once you have root to write `/tvservice` and run `insmod`.
+
+### FINDINGS #3 — MBOOT KL/RFS verification ⚠️ CORRECTED 2026-10-14
+> The original claim here ("full RSA auth of KL/RFS every boot") was **wrong** — it was inferred from the mere *presence* of `do_Authenticate_FileSystem` symbols, not from tracing the boot path. Control-flow analysis (agent MiMo, Ghidra) + independent Capstone verification show the opposite. Full write-up + evidence: `finding_mimo/SECURE_BOOT_TIMING.md` and `finding_mimo/HANDOFF.md`.
+
+**On the normal (non-OTA) boot path, MBOOT does NOT RSA/SHA-verify KL or RFS.** The default `bootcmd` is `mmc read.p … KL …; bootm` — a plain read + `bootm` (CRC/header sanity + A/B fallback only). RSA-2048 partition authentication code **exists** but is reachable **only** via the `authenticate` / `SecureBootCmd` / `readKL→bootKL` commands, which appear only in OTA/recovery env scripts (`recoverycmd = "authenticate recovery 0x25000000; bootm …"`) and the console — **not** in the default `bootcmd`.
+
+Independently verified (Capstone call-graph on `mboot.bin`):
+- VA map confirmed: cmd-table stores link VAs (`file_off+0x256F7E00`); runtime = +0x200.
+- `do_bootm` (`0x257b4d24`): 65 callees, **none** crypto/auth.
+- `FUN_2575d994` (partition-auth) has **exactly one** caller — the `authenticate` handler.
+- **No** auth/crypto function is reachable from `do_bootm`, `MstarToKernel`, `MstarProcess`, or the `mmc` handler.
+- Auth functions have **zero** data-pointer refs → cannot be invoked by indirect dispatch (closes the "transparent authenticate-on-read" caveat).
+- Every-boot chain of trust (via prior **sboot** stage, eFUSE keys) covers **MBOOT + OPTEE + ARMFW** only; KL/RFS are not in it for this config.
+
+The **partial-authentication** feature is real (env `partial_partition`, `IsDoingPartialAuthentication`, `Enable/DisablePartialAuthentication` via `setenv`/`saveenv`) but only tunes *how much* of a partition the `authenticate` command hashes — it is not on the normal boot path and not a bypass.
+
+→ **Implication:** "verify-on-install, CRC-on-boot" design. If the **live TV's saved `bootcmd`** matches this default, a modified KL/RFS could boot without a signature failure — "boot own kernel" would be an **env-config gap, not a crypto wall.** Not yet confirmed on the real unit (this is the default env of a downloaded image). **Decisive check: UART `printenv` → read the live `bootcmd`.** The code-execution route (unsigned `tvservice` + unsigned `.ko`) stands regardless.
+
+**Tooling note:** REA's Ghidra provider on this Windows host rejects ARM targets (x86/x64 PE only); MBOOT analysis uses the project's own Ghidra-headless output under `finding_mimo/` plus independent Capstone 5.0.7 scripts.
